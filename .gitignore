@@ -61,3 +61,7 @@ Desktop.ini
 *.sln.iml
 
 .vscode/
+
+1.0_BackUpThisFolder_ButDontShipItWithYourGame/
+
+.utmp/

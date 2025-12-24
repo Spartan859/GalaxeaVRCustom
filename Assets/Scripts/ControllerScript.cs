@@ -1,5 +1,6 @@
 using UnityEngine;
 using System.Collections;
+using System.Collections.Generic;
 using System.Text;
 using System.Net.Sockets;
 using System;
@@ -21,6 +22,13 @@ public class ControllerScript : MonoBehaviour
     
     [Tooltip("发送ping指令的时间间隔(秒)")]
     public float pingInterval = 1.0f;
+
+    [Tooltip("ping响应超时时间(毫秒)")]
+    public int pingTimeoutMs = 2000;
+    
+    [Header("Queue Settings")]
+    [Tooltip("发送队列和接收队列的最大大小")]
+    public int maxQueueSize = 100;
     
     [Header("Mode Settings")]
     [Tooltip("长按摇杆切换模式的时间(秒)")]
@@ -29,6 +37,10 @@ public class ControllerScript : MonoBehaviour
     [Tooltip("在Reset模式下长按右摇杆发送reset指令的时间(秒)")]
     public float resetCommandDuration = 1.0f;
 
+    [Header("Joystick Settings")]
+    [Tooltip("摇杆死区阈值（小于此值的输入将被忽略）")]
+    public float joystickDeadzone = 0.15f;
+    
     [Header("Chassis Settings")]
     [Tooltip("底盘前后速度上限 vx（摇杆y轴，范围[-maxVx, maxVx]）")]
     public float maxVx = 0.2f;
@@ -40,11 +52,11 @@ public class ControllerScript : MonoBehaviour
     public float maxW = 1.0f;
 
     [Header("Gripper Settings")]
-    [Tooltip("夹爪张开时的值（0-100）")]
-    public float gripperOpen = 100f;
+    [Tooltip("夹爪变化速率 (每秒变化量)")]
+    public float gripperChangeSpeed = 50.0f;
 
-    [Tooltip("夹爪收紧时的值（0-100）")]
-    public float gripperClosed = 0f;
+    [Tooltip("夹爪短按判定时间 (秒)")]
+    public float gripperShortPressTime = 0.3f;
 
     [Header("Torso Settings")]
     [Tooltip("躯干前后速度上限 vx（X和Y键，范围[-maxTorsoVx, maxTorsoVx]）")]
@@ -67,10 +79,11 @@ public class ControllerScript : MonoBehaviour
     private float rightThumbstickPressTimer = 0f;  // 右摇杆按下的计时
     private bool isRightThumbstickPressed = false;  // 右摇杆是否被按下
     private bool resetCommandInThisPress = false;  // 当前按下周期中是否已经发送过reset指令
-    private bool leftGripperOpen = true;  // 左夹爪状态：true=张开，false=收紧
-    private bool rightGripperOpen = true; // 右夹爪状态
-    private bool lastLeftTriggerDown = false;  // 上一帧LT按键状态，用于检测按下事件
-    private bool lastRightTriggerDown = false; // 上一帧RT按键状态
+    private bool resetRequested = false;  // 是否请求了reset
+    private float currentLeftGripper = 100f;
+    private float currentRightGripper = 100f;
+    private float leftTriggerTimer = 0f;
+    private float rightTriggerTimer = 0f;
     private bool lastAButtonDown = false;      // 上一帧A按键状态（俯仰+）
     private bool lastBButtonDown = false;      // 上一帧B按键状态（俯仰-）
     private bool lastXButtonDown = false;      // 上一帧X按键状态（前进）
@@ -80,12 +93,20 @@ public class ControllerScript : MonoBehaviour
     private TcpClient tcpClient;
     private NetworkStream stream;
     private bool isConnected = false;
+    private bool isReconnecting = false;  // 防止并发重连
+    private bool connectionFailed = false;  // 连接彻底失败标志
     private int reconnectAttempts = 0;
     private const int maxReconnectAttempts = 5;
     private readonly SemaphoreSlim sendLock = new SemaphoreSlim(1, 1);
     private readonly ConcurrentQueue<string> sendQueue = new ConcurrentQueue<string>();
     private CancellationTokenSource sendCts;
     private Task sendTask;
+    private readonly SemaphoreSlim receiveLock = new SemaphoreSlim(1, 1);
+    private readonly ConcurrentQueue<string> receiveQueue = new ConcurrentQueue<string>();
+    private CancellationTokenSource receiveCts;
+    private Task receiveTask;
+    private readonly SemaphoreSlim receiveQueueSizeLock = new SemaphoreSlim(1, 1);  // 保护receiveQueue大小检查和删除
+    private readonly SemaphoreSlim responseWaitLock = new SemaphoreSlim(1, 1);  // 保护 WaitForResponseAsync
     private OVRCameraRig ovrCameraRig;  // VR相机设备引用
 
     // 累计发送差量的上一帧基准
@@ -94,6 +115,8 @@ public class ControllerScript : MonoBehaviour
     private Vector3 lastRightPos;
     private Quaternion lastLeftRot;
     private Quaternion lastRightRot;
+    private float lastLeftGripperSent = 100f;
+    private float lastRightGripperSent = 100f;
     
     // 模式枚举
     private enum ControlMode
@@ -115,6 +138,7 @@ public class ControllerScript : MonoBehaviour
         
         await ConnectToServer();
         StartSendLoop();
+        StartReceiveLoop();
     }
     
     async Task ConnectToServer()
@@ -125,7 +149,13 @@ public class ControllerScript : MonoBehaviour
             await tcpClient.ConnectAsync(serverHost, serverPort);
             stream = tcpClient.GetStream();
             isConnected = true;
-            reconnectAttempts = 0;
+            
+            // 只在初始连接时重置重连次数（非重连状态）
+            if (!isReconnecting)
+            {
+                reconnectAttempts = 0;
+            }
+            
             Debug.Log($"已连接到服务器 {serverHost}:{serverPort}");
         }
         catch (Exception e)
@@ -141,9 +171,19 @@ public class ControllerScript : MonoBehaviour
         sendCts = new CancellationTokenSource();
         sendTask = Task.Run(() => ProcessSendQueue(sendCts.Token));
     }
+
+    void StartReceiveLoop()
+    {
+        if (receiveTask != null && !receiveTask.IsCompleted) return;
+        receiveCts = new CancellationTokenSource();
+        receiveTask = Task.Run(() => ProcessReceiveQueue(receiveCts.Token));
+    }
     
     void Update()
     {
+        // 如果连接已彻底失败，停止所有操作
+        if (connectionFailed) return;
+        
         if (!isConnected) return;
         
         // 获取头显（VR眼镜）的位置和旋转
@@ -219,6 +259,12 @@ public class ControllerScript : MonoBehaviour
         Vector2 leftStick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick);
         Vector2 rightStick = OVRInput.Get(OVRInput.Axis2D.SecondaryThumbstick);
         
+        // 应用死区：如果某个轴的值小于死区阈值，将其设为0
+        if (Mathf.Abs(leftStick.x) < joystickDeadzone) leftStick.x = 0f;
+        if (Mathf.Abs(leftStick.y) < joystickDeadzone) leftStick.y = 0f;
+        if (Mathf.Abs(rightStick.x) < joystickDeadzone) rightStick.x = 0f;
+        if (Mathf.Abs(rightStick.y) < joystickDeadzone) rightStick.y = 0f;
+        
         // 检测右摇杆按下(OVRInput.Button.SecondaryThumbstick)，仅在Reset模式下有效
         bool rightThumbstickDown = OVRInput.Get(OVRInput.Button.SecondaryThumbstick);
         
@@ -239,7 +285,7 @@ public class ControllerScript : MonoBehaviour
                 // 检查是否达到发送reset指令的时长，且在本次按下中还未发送过
                 if (rightThumbstickPressTimer >= resetCommandDuration && !resetCommandInThisPress)
                 {
-                    SendResetAsync();
+                    resetRequested = true;  // 标记reset请求
                     resetCommandInThisPress = true;  // 标记本次按下已经发送过reset指令
                 }
             }
@@ -282,29 +328,43 @@ public class ControllerScript : MonoBehaviour
         if (aButtonDown) torsoVx -= maxTorsoVx;
         if (bButtonDown) torsoVx += maxTorsoVx;
 
-        // 检测LT/RT按键，切换夹爪状态
+        // 检测LT/RT按键，控制夹爪
         bool leftTriggerDown = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger);
         bool rightTriggerDown = OVRInput.Get(OVRInput.Button.SecondaryIndexTrigger);
         
-        // 左夹爪：检测LT从未按到按下的边缘
-        if (leftTriggerDown && !lastLeftTriggerDown)
+        // 左夹爪逻辑
+        if (leftTriggerDown)
         {
-            leftGripperOpen = !leftGripperOpen;
-            Debug.Log($"左夹爪 {(leftGripperOpen ? "张开" : "收紧")}");
+            leftTriggerTimer += Time.deltaTime;
+            // 长按：缓慢减小数值
+            currentLeftGripper -= gripperChangeSpeed * Time.deltaTime;
         }
-        lastLeftTriggerDown = leftTriggerDown;
-        
-        // 右夹爪：检测RT从未按到按下的边缘
-        if (rightTriggerDown && !lastRightTriggerDown)
+        else
         {
-            rightGripperOpen = !rightGripperOpen;
-            Debug.Log($"右夹爪 {(rightGripperOpen ? "张开" : "收紧")}");
+            // 松开瞬间判断是否为短按
+            if (leftTriggerTimer > 0f && leftTriggerTimer < gripperShortPressTime)
+            {
+                currentLeftGripper = 100f; // 短按恢复
+            }
+            leftTriggerTimer = 0f;
         }
-        lastRightTriggerDown = rightTriggerDown;
+        currentLeftGripper = Mathf.Clamp(currentLeftGripper, 0f, 100f);
 
-        // 计算gripper值
-        float leftGripperValue = leftGripperOpen ? gripperOpen : gripperClosed;
-        float rightGripperValue = rightGripperOpen ? gripperOpen : gripperClosed;
+        // 右夹爪逻辑
+        if (rightTriggerDown)
+        {
+            rightTriggerTimer += Time.deltaTime;
+            currentRightGripper -= gripperChangeSpeed * Time.deltaTime;
+        }
+        else
+        {
+            if (rightTriggerTimer > 0f && rightTriggerTimer < gripperShortPressTime)
+            {
+                currentRightGripper = 100f;
+            }
+            rightTriggerTimer = 0f;
+        }
+        currentRightGripper = Mathf.Clamp(currentRightGripper, 0f, 100f);
 
         // 按照设定的时间间隔发送数据
         timer += Time.deltaTime;
@@ -315,15 +375,16 @@ public class ControllerScript : MonoBehaviour
             {
                 // BiManual模式下发送机械臂+底盘+躯干
                 _ = SendControllerDataAsync(leftControllerPosition, leftControllerRotation, 
-                                          rightControllerPosition, rightControllerRotation, vx, vy, w, leftGripperValue, rightGripperValue,
-                                          torsoVx, torsoVz, torsoWPitch, torsoWYaw);
+                                          rightControllerPosition, rightControllerRotation, vx, vy, w, currentLeftGripper, currentRightGripper,
+                                          torsoVx, torsoVz, torsoWPitch, torsoWYaw, resetRequested);
             }
             else
             {
                 // Reset模式下只发送底盘+躯干，机械臂数据为零
-                _ = SendControllerDataAsync(Vector3.zero, Quaternion.identity, Vector3.zero, Quaternion.identity, vx, vy, w, leftGripperValue, rightGripperValue,
-                                          torsoVx, torsoVz, torsoWPitch, torsoWYaw);
+                _ = SendControllerDataAsync(Vector3.zero, Quaternion.identity, Vector3.zero, Quaternion.identity, vx, vy, w, currentLeftGripper, currentRightGripper,
+                                          torsoVx, torsoVz, torsoWPitch, torsoWYaw, resetRequested);
             }
+            resetRequested = false;  // 清除reset标志
         }
         
         // 按照设定的时间间隔发送ping指令
@@ -360,9 +421,10 @@ public class ControllerScript : MonoBehaviour
         return angle;
     }
 
-    async Task SendControllerDataAsync(Vector3 leftPos, Quaternion leftRot, Vector3 rightPos, Quaternion rightRot, float vx = 0f, float vy = 0f, float w = 0f, float leftGripperValue = 0f, float rightGripperValue = 0f, float torsoVx = 0f, float torsoVz = 0f, float torsoWPitch = 0f, float torsoWYaw = 0f)
+    async Task SendControllerDataAsync(Vector3 leftPos, Quaternion leftRot, Vector3 rightPos, Quaternion rightRot, float vx = 0f, float vy = 0f, float w = 0f, float leftGripperValue = 0f, float rightGripperValue = 0f, float torsoVx = 0f, float torsoVz = 0f, float torsoWPitch = 0f, float torsoWYaw = 0f, bool sendReset = false)
     {
-        if (!isConnected || stream == null) return;
+        // 如果连接已失败，不再发送
+        if (!isConnected || stream == null || connectionFailed) return;
         
         try
         {
@@ -382,6 +444,8 @@ public class ControllerScript : MonoBehaviour
             Vector3 deltaPosR;
             Vector3 deltaEulerL;
             Vector3 deltaEulerR;
+            float deltaGripperL;
+            float deltaGripperR;
 
             if (!hasLastSend)
             {
@@ -390,6 +454,8 @@ public class ControllerScript : MonoBehaviour
                 deltaPosR = Vector3.zero;
                 deltaEulerL = Vector3.zero;
                 deltaEulerR = Vector3.zero;
+                deltaGripperL = 0f;
+                deltaGripperR = 0f;
                 hasLastSend = true;
             }
             else
@@ -414,25 +480,49 @@ public class ControllerScript : MonoBehaviour
                     NormalizeAngle(eulerR.y) * Mathf.Deg2Rad,
                     NormalizeAngle(eulerR.z) * Mathf.Deg2Rad
                 );
+
+                deltaGripperL = leftGripperValue - lastLeftGripperSent;
+                deltaGripperR = rightGripperValue - lastRightGripperSent;
             }
 
             lastLeftPos = leftToSendSwapped;
             lastRightPos = rightToSendSwapped;
             lastLeftRot = leftQuatSwapped;
             lastRightRot = rightQuatSwapped;
+            lastLeftGripperSent = leftGripperValue;
+            lastRightGripperSent = rightGripperValue;
 
-            // 构造 send_action 命令，包含chassis_speed、torso_speed和gripper
+            // 构造 send_action 命令，包含chassis_speed、torso_speed、gripper和可选reset
             // 注意：这里改为发送 droll, dpitch, dyaw (6个元素)
             string jsonData = string.Format(
-                "{{\"cmd\":\"send_action\",\"action\":{{\"left_ee_pose\":[{0},{1},{2},{3},{4},{5}],\"right_ee_pose\":[{6},{7},{8},{9},{10},{11}],\"left_gripper\":{12},\"right_gripper\":{13},\"chassis_speed\":[{14},{15},{16}],\"torso_speed\":[{17},{18},{19},{20}]}}}}",
+                "{{\"cmd\":\"send_action\",\"action\":{{\"left_ee_pose\":[{0},{1},{2},{3},{4},{5}],\"right_ee_pose\":[{6},{7},{8},{9},{10},{11}],\"left_gripper\":{12},\"right_gripper\":{13},\"chassis_speed\":[{14},{15},{16}],\"torso_speed\":[{17},{18},{19},{20}],\"reset\":{21}}}}}",
                 deltaPosL.x, deltaPosL.y, deltaPosL.z, deltaEulerL.x, deltaEulerL.y, deltaEulerL.z,
                 deltaPosR.x, deltaPosR.y, deltaPosR.z, deltaEulerR.x, deltaEulerR.y, deltaEulerR.z,
-                leftGripperValue, rightGripperValue,
+                deltaGripperL, deltaGripperR,
                 vx, vy, w,
-                torsoVx, torsoVz, torsoWPitch, torsoWYaw
+                torsoVx, torsoVz, torsoWPitch, torsoWYaw,
+                sendReset.ToString().ToLower()  // 转为小写 "true" 或 "false"
             );
             
             EnqueueMessage(jsonData);
+            
+            // 等待action响应，过滤出包含"action"的消息
+            try
+            {
+                string response = await WaitForResponseAsync(pingTimeoutMs, msg => msg.Contains("action"));
+                // Debug.Log($"[Action Response] {response}");  // 可选：取消注释以打印每次action响应
+            }
+            catch (OperationCanceledException)
+            {
+                Debug.LogWarning("action响应超时，触发重连");
+                await ReconnectAsync();
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"等待action响应异常: {e.Message}，触发重连");
+                await ReconnectAsync();
+            }
+            
             return;
         }
         catch (Exception e)
@@ -444,8 +534,16 @@ public class ControllerScript : MonoBehaviour
     
     async Task ReconnectAsync()
     {
+        // 如果连接已彻底失败，不再尝试
+        if (connectionFailed) return;
+        
+        // 防止并发多个重连请求
+        if (isReconnecting) return;
+        isReconnecting = true;
+        
         try
         {
+            // 立即关闭连接，清空队列中的所有堆积消息
             if (stream != null)
             {
                 stream.Close();
@@ -456,6 +554,20 @@ public class ControllerScript : MonoBehaviour
             }
             
             isConnected = false;
+            
+            // 清空发送队列和接收队列，移除所有堆积的消息
+            while (sendQueue.TryDequeue(out _)) { }
+            
+            await receiveQueueSizeLock.WaitAsync();
+            try
+            {
+                while (receiveQueue.TryDequeue(out _)) { }
+            }
+            finally
+            {
+                receiveQueueSizeLock.Release();
+            }
+            
             reconnectAttempts++;
             
             if (reconnectAttempts < maxReconnectAttempts)
@@ -466,12 +578,18 @@ public class ControllerScript : MonoBehaviour
             }
             else
             {
-                Debug.LogError($"重连失败超过 {maxReconnectAttempts} 次，停止重连");
+                // 重连失败次数达到上限，标记连接彻底失败
+                connectionFailed = true;
+                Debug.LogError($"重连失败超过 {maxReconnectAttempts} 次，停止重连。请检查服务器连接");
             }
         }
         catch (Exception e)
         {
             Debug.LogError($"重连异常: {e.Message}");
+        }
+        finally
+        {
+            isReconnecting = false;
         }
     }
 
@@ -578,7 +696,28 @@ public class ControllerScript : MonoBehaviour
         {
             string jsonData = "{\"cmd\":\"ping\"}";
             EnqueueMessage(jsonData);
-            // Debug.Log("已发送ping指令");
+            
+            // 等待ping响应，过滤出包含"pong"的消息
+            try
+            {
+                string response = await WaitForResponseAsync(pingTimeoutMs, msg => msg.Contains("pong"));
+                Debug.Log($"[Ping Response] {response}");
+                if (string.IsNullOrEmpty(response) || (!response.Contains("\"ok\"") && !response.Contains("\"ok\":")))
+                {
+                    Debug.LogWarning($"ping响应异常: {response}，触发重连");
+                    await ReconnectAsync();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Debug.LogWarning("ping响应超时，触发重连");
+                await ReconnectAsync();
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"等待ping响应异常: {e.Message}，触发重连");
+                await ReconnectAsync();
+            }
         }
         catch (Exception e)
         {
@@ -587,27 +726,113 @@ public class ControllerScript : MonoBehaviour
         }
     }
 
-    async Task SendResetAsync()
+    async Task<string> WaitForResponseAsync(int timeoutMs = 2000, System.Func<string, bool> filter = null)
     {
-        if (!isConnected || stream == null) return;
-        
+        // 同一时刻只允许一个线程执行，防止竞态条件
+        await responseWaitLock.WaitAsync();
         try
         {
-            string jsonData = "{\"cmd\":\"reset\"}";
-            EnqueueMessage(jsonData);
-            Debug.Log("已发送reset指令，机器人正在复位...");
-            hasLastSend = false;  // 复位后需要重新初始化位置基准
+            var deadline = System.DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            var tempQueue = new Queue<string>(); // 临时存储不匹配的消息
+            
+            while (System.DateTime.UtcNow < deadline)
+            {
+                // 如果连接已失败，立即返回
+                if (connectionFailed)
+                {
+                    throw new OperationCanceledException("连接已失败");
+                }
+                
+                // 先尝试从临时队列取
+                if (tempQueue.Count > 0)
+                {
+                    var temp = tempQueue.Dequeue();
+                    if (filter == null || filter(temp))
+                    {
+                        // 匹配，返回，并把临时队列剩余消息放回接收队列
+                        while (tempQueue.Count > 0)
+                        {
+                            receiveQueue.Enqueue(tempQueue.Dequeue());
+                        }
+                        return temp;
+                    }
+                    // 不匹配，继续找
+                }
+                
+                // 从接收队列取
+                if (receiveQueue.TryDequeue(out var message))
+                {
+                    if (filter == null || filter(message))
+                    {
+                        // 匹配，返回，并把临时队列的消息放回接收队列
+                        await receiveQueueSizeLock.WaitAsync();
+                        try
+                        {
+                            while (tempQueue.Count > 0)
+                            {
+                                var msg = tempQueue.Dequeue();
+                                receiveQueue.Enqueue(msg);
+                                // 如果队列超过限制，丢弃最老的消息
+                                while (receiveQueue.Count > maxQueueSize)
+                                {
+                                    receiveQueue.TryDequeue(out _);
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            receiveQueueSizeLock.Release();
+                        }
+                        return message;
+                    }
+                    else
+                    {
+                        // 不匹配，放入临时队列
+                        tempQueue.Enqueue(message);
+                    }
+                }
+                
+                await Task.Delay(10);
+            }
+            
+            // 超时，把临时队列的消息放回接收队列
+            await receiveQueueSizeLock.WaitAsync();
+            try
+            {
+                while (tempQueue.Count > 0)
+                {
+                    var msg = tempQueue.Dequeue();
+                    receiveQueue.Enqueue(msg);
+                    // 如果队列超过限制，丢弃最老的消息
+                    while (receiveQueue.Count > maxQueueSize)
+                    {
+                        receiveQueue.TryDequeue(out _);
+                    }
+                }
+            }
+            finally
+            {
+                receiveQueueSizeLock.Release();
+            }
+            
+            throw new OperationCanceledException("等待响应超时");
         }
-        catch (Exception e)
+        finally
         {
-            Debug.LogWarning($"发送reset指令失败: {e.Message}");
-            await ReconnectAsync();
+            responseWaitLock.Release();
         }
     }
+
+
 
     void EnqueueMessage(string json)
     {
         sendQueue.Enqueue(json);
+        // 如果队列超过限制，丢弃最老的消息
+        while (sendQueue.Count > maxQueueSize)
+        {
+            sendQueue.TryDequeue(out _);
+        }
     }
     
     async Task ProcessSendQueue(CancellationToken token)
@@ -643,6 +868,51 @@ public class ControllerScript : MonoBehaviour
             }
         }
     }
+
+    async Task ProcessReceiveQueue(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                if (!isConnected || stream == null)
+                {
+                    await Task.Delay(50, token);
+                    continue;
+                }
+
+                try
+                {
+                    string message = await ReceiveTcpMessageAsync(token);
+                    receiveQueue.Enqueue(message);
+                    
+                    // 如果队列超过限制，丢弃最老的消息（原子操作）
+                    await receiveQueueSizeLock.WaitAsync();
+                    try
+                    {
+                        while (receiveQueue.Count > maxQueueSize)
+                        {
+                            receiveQueue.TryDequeue(out _);
+                        }
+                    }
+                    finally
+                    {
+                        receiveQueueSizeLock.Release();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // 正常超时或关闭
+                    break;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"接收队列处理异常: {e.Message}，触发重连");
+                await ReconnectAsync();
+            }
+        }
+    }
     
     async Task SendTcpMessageAsync(string jsonMessage)
     {
@@ -670,13 +940,15 @@ public class ControllerScript : MonoBehaviour
         }
     }
     
-    async Task<string> ReceiveTcpMessageAsync(int timeoutMs = 2000)
+    async Task<string> ReceiveTcpMessageAsync(CancellationToken token = default)
     {
-        using (var cts = new System.Threading.CancellationTokenSource(timeoutMs))
+        // 确保只有一个线程读取 NetworkStream
+        await receiveLock.WaitAsync(token);
+        try
         {
             // 读取4字节长度前缀
             byte[] lengthBytes = new byte[4];
-            int bytesRead = await stream.ReadAsync(lengthBytes, 0, 4, cts.Token);
+            int bytesRead = await stream.ReadAsync(lengthBytes, 0, 4, token);
             if (bytesRead != 4)
             {
                 throw new Exception("无法读取消息长度");
@@ -693,7 +965,7 @@ public class ControllerScript : MonoBehaviour
             int totalRead = 0;
             while (totalRead < messageLength)
             {
-                int read = await stream.ReadAsync(messageBytes, totalRead, (int)(messageLength - totalRead), cts.Token);
+                int read = await stream.ReadAsync(messageBytes, totalRead, (int)(messageLength - totalRead), token);
                 if (read == 0)
                 {
                     throw new Exception("连接断开");
@@ -703,6 +975,10 @@ public class ControllerScript : MonoBehaviour
             
             return Encoding.UTF8.GetString(messageBytes);
         }
+        finally
+        {
+            receiveLock.Release();
+        }
     }
     
     void OnDestroy()
@@ -710,6 +986,7 @@ public class ControllerScript : MonoBehaviour
         try
         {
             sendCts?.Cancel();
+            receiveCts?.Cancel();
         }
         catch { }
         
