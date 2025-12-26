@@ -143,6 +143,7 @@ public class ControllerScript : MonoBehaviour
     
     async Task ConnectToServer()
     {
+        Debug.Log($"ConnectToServer() called. isReconnecting={isReconnecting}, reconnectAttempts={reconnectAttempts}");
         try
         {
             tcpClient = new TcpClient();
@@ -162,6 +163,9 @@ public class ControllerScript : MonoBehaviour
         {
             Debug.LogError($"连接服务器失败: {e.Message}");
             isConnected = false;
+            // 初始连接失败时也标记为彻底失败，需通过 A+X 手动重试或检查服务器
+            connectionFailed = true;
+            Debug.LogError("初始连接失败，已设置 connectionFailed=true。按 A+X 重试或检查服务器。");
         }
     }
 
@@ -181,9 +185,43 @@ public class ControllerScript : MonoBehaviour
     
     void Update()
     {
-        // 如果连接已彻底失败，停止所有操作
+        // 在断线/失败状态下仍需响应重连快捷键，先采样 A/X 用于边沿检测
+        bool aNowForReconnect = OVRInput.Get(OVRInput.Button.One);
+        bool xNowForReconnect = OVRInput.Get(OVRInput.Button.Three);
+        // 少量信息性日志，便于确认按键采样与状态（仅在断线或有按键时打印，避免刷屏）
+        if (connectionFailed || aNowForReconnect || xNowForReconnect)
+        {
+            Debug.Log($"A+X sample: A={aNowForReconnect}, X={xNowForReconnect}, connectionFailed={connectionFailed}, lastA={lastAButtonDown}, lastX={lastXButtonDown}, isReconnecting={isReconnecting}, isConnected={isConnected}");
+        }
+
+        if (connectionFailed && aNowForReconnect && xNowForReconnect)
+        {
+            if (!(lastAButtonDown && lastXButtonDown))
+            {
+                Debug.Log("A+X 边沿检测通过：重置 connectionFailed，重置 reconnectAttempts 并调用 ConnectToServer()");
+                connectionFailed = false;
+                reconnectAttempts = 0;
+                try
+                {
+                    _ = ConnectToServer();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"调用 ConnectToServer() 时捕获异常: {ex.Message}");
+                }
+            }
+            else
+            {
+                Debug.Log("A+X 同时按下但已在上一帧保持，忽略重复触发");
+            }
+        }
+        // 立即更新上一帧按键状态，避免重复触发
+        lastAButtonDown = aNowForReconnect;
+        lastXButtonDown = xNowForReconnect;
+
+        // 如果连接已彻底失败，停止其他操作
         if (connectionFailed) return;
-        
+
         if (!isConnected) return;
         
         // 获取头显（VR眼镜）的位置和旋转
@@ -308,11 +346,11 @@ public class ControllerScript : MonoBehaviour
         float torsoVz = Mathf.Clamp(rightStick.y, -1f, 1f) * maxTorsoVz;
         
         // w_pitch: X和Y键（俯仰）
-        bool xButtonDown = OVRInput.Get(OVRInput.Button.Four);     // X键：抬起
-        bool yButtonDown = OVRInput.Get(OVRInput.Button.Three);    // Y键：低头
+        bool yButtonDown = OVRInput.Get(OVRInput.Button.Four);     // X键：抬起
+        bool xButtonDown = OVRInput.Get(OVRInput.Button.Three);    // Y键：低头
         float torsoWPitch = 0f;
-        if (xButtonDown) torsoWPitch += maxTorsoWPitch;
-        if (yButtonDown) torsoWPitch -= maxTorsoWPitch;
+        if (xButtonDown) torsoWPitch -= maxTorsoWPitch;
+        if (yButtonDown) torsoWPitch += maxTorsoWPitch;
         
         // w_yaw: 左G和右G（转向）
         bool leftGrip = OVRInput.Get(OVRInput.Button.PrimaryHandTrigger);
@@ -327,6 +365,8 @@ public class ControllerScript : MonoBehaviour
         float torsoVx = 0f;
         if (aButtonDown) torsoVx -= maxTorsoVx;
         if (bButtonDown) torsoVx += maxTorsoVx;
+
+
 
         // 检测LT/RT按键，控制夹爪
         bool leftTriggerDown = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger);
@@ -394,6 +434,10 @@ public class ControllerScript : MonoBehaviour
             pingTimer = 0f;
             _ = SendPingAsync();
         }
+
+        // 更新上一帧按钮状态（用于边沿检测）
+        lastAButtonDown = aButtonDown;
+        lastXButtonDown = xButtonDown;
     }
     
     void ToggleMode()
