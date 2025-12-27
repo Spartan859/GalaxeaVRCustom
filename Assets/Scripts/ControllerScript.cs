@@ -260,38 +260,7 @@ public class ControllerScript : MonoBehaviour
         
         // Debug.Log($"[当前手柄角度] 左手: Roll={leftEulerDeg.x:F2}° Pitch={leftEulerDeg.y:F2}° Yaw={leftEulerDeg.z:F2}° | 右手: Roll={rightEulerDeg.x:F2}° Pitch={rightEulerDeg.y:F2}° Yaw={rightEulerDeg.z:F2}°");
         
-        // 检测左摇杆按下(OVRInput.Button.PrimaryThumbstick)
-        bool thumbstickDown = OVRInput.Get(OVRInput.Button.PrimaryThumbstick);
-        
-        if (thumbstickDown)
-        {
-            if (!isThumbstickPressed)
-            {
-                // 刚按下，开始计时
-                isThumbstickPressed = true;
-                thumbstickPressTimer = 0f;
-                modeToggleInThisPress = false;  // 重置本次按下的切换标志
-            }
-            else
-            {
-                // 持续按下，累加时间
-                thumbstickPressTimer += Time.deltaTime;
-                
-                // 检查是否达到切换时长，且在本次按下中还未切换过
-                if (thumbstickPressTimer >= modeToggleDuration && !modeToggleInThisPress)
-                {
-                    ToggleMode();
-                    modeToggleInThisPress = true;  // 标记本次按下已经切换过
-                }
-            }
-        }
-        else
-        {
-            // 松开摇杆，重置状态
-            isThumbstickPressed = false;
-            thumbstickPressTimer = 0f;
-            modeToggleInThisPress = false;  // 重置切换标志，为下一次按下做准备
-        }
+        // 摇杆长按切换逻辑已移除，改为使用左右握把同时按下切换模式
         
         // 获取左摇杆（PrimaryThumbstick）和右摇杆（SecondaryThumbstick）输入
         Vector2 leftStick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick);
@@ -358,6 +327,21 @@ public class ControllerScript : MonoBehaviour
         float torsoWYaw = 0f;
         if (leftGrip) torsoWYaw += maxTorsoWYaw;
         if (rightGrip) torsoWYaw -= maxTorsoWYaw;
+
+        // 新的模式绑定：当左右握把同时按下时进入 BiManual，否则为 Reset
+        bool bothGrips = leftGrip && rightGrip;
+        if (bothGrips && currentMode != ControlMode.BiManual)
+        {
+            currentMode = ControlMode.BiManual;
+            hasLastSend = false; // 切换到 BiManual 时重置基准以避免巨大增量
+            Debug.Log("模式切换：检测到左右握把同时按下，已切换到 BiManual 模式");
+        }
+        else if (!bothGrips && currentMode != ControlMode.Reset)
+        {
+            currentMode = ControlMode.Reset;
+            hasLastSend = false;
+            Debug.Log("模式切换：左右握把未同时按下，已切换到 Reset 模式");
+        }
         
         // vx: A和B键（前后）
         bool aButtonDown = OVRInput.Get(OVRInput.Button.One);      // A键：后退
