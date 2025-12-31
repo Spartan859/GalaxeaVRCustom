@@ -114,15 +114,6 @@ public class ControllerScript : MonoBehaviour
     private float lastLeftGripperSent = 100f;
     private float lastRightGripperSent = 100f;
     
-    // 模式枚举
-    private enum ControlMode
-    {
-        Reset,      // Reset模式，不发送坐标
-        BiManual    // BiManual模式，发送控制器坐标
-    }
-    
-    private ControlMode currentMode = ControlMode.Reset;
-
     // 上层模式：Normal / Event
     private enum UpperControlMode
     {
@@ -318,7 +309,6 @@ public class ControllerScript : MonoBehaviour
 
             SampleHeadAndControllers();
             ApplyDeadzoneAndComputeSpeeds();
-            HandleModeSwitch();
             HandleGripperInputs();
             HandleSendAndPing();
             UpdateLastButtonStates();
@@ -399,23 +389,6 @@ public class ControllerScript : MonoBehaviour
         if (_bButtonDown) _torsoVx += maxTorsoVx;
     }
 
-    void HandleModeSwitch()
-    {
-        bool bothGrips = _leftGrip && _rightGrip;
-        if (bothGrips && currentMode != ControlMode.BiManual)
-        {
-            currentMode = ControlMode.BiManual;
-            hasLastSend = false;
-            Debug.Log("模式切换：检测到左右握把同时按下，已切换到 BiManual 模式");
-        }
-        else if (!bothGrips && currentMode != ControlMode.Reset)
-        {
-            currentMode = ControlMode.Reset;
-            hasLastSend = false;
-            Debug.Log("模式切换：左右握把未同时按下，已切换到 Reset 模式");
-        }
-    }
-
     void HandleGripperInputs()
     {
         if (_leftTriggerDown)
@@ -483,28 +456,45 @@ public class ControllerScript : MonoBehaviour
             Vector3 sendRightPos = _rightControllerPosition;
             Quaternion sendRightRot = _rightControllerRotation;
 
-            // Event 模式下发送零机械臂姿态，仅携带事件和干预标志
+            Vector3 deltaPosL;
+            Vector3 deltaPosR;
+            Vector3 deltaEulerL;
+            Vector3 deltaEulerR;
+            float deltaGripperL;
+            float deltaGripperR;
+
+            ComputePoseAndDelta(sendLeftPos, sendLeftRot, sendRightPos, sendRightRot, currentLeftGripper, currentRightGripper,
+                                out deltaPosL, out deltaPosR, out deltaEulerL, out deltaEulerR, out deltaGripperL, out deltaGripperR);
+
+            // 只零化增量，不修改当前采样姿态
             if (currentUpperMode == UpperControlMode.Event)
             {
-                sendLeftPos = Vector3.zero;
-                sendRightPos = Vector3.zero;
-                sendLeftRot = Quaternion.identity;
-                sendRightRot = Quaternion.identity;
-            }
-
-            // 不再支持按住 X+Y 或 A+B 进行手部复制。仅在 BiManual 模式下发送实际手柄数据，
-            // 在 Reset 模式下发送零机械臂数据（保持之前的语义）。
-            if (currentMode == ControlMode.BiManual && currentUpperMode == UpperControlMode.Normal)
-            {
-                _ = SendControllerDataAsync(sendLeftPos, sendLeftRot,
-                                          sendRightPos, sendRightRot, _vx, _vy, _w, currentLeftGripper, currentRightGripper,
-                                          _torsoVx, _torsoVz, _torsoWPitch, _torsoWYaw, _isIntervention, _eventToSend);
+                deltaPosL = Vector3.zero;
+                deltaPosR = Vector3.zero;
+                deltaEulerL = Vector3.zero;
+                deltaEulerR = Vector3.zero;
+                deltaGripperL = 0f;
+                deltaGripperR = 0f;
             }
             else
             {
-                _ = SendControllerDataAsync(Vector3.zero, Quaternion.identity, Vector3.zero, Quaternion.identity, _vx, _vy, _w, currentLeftGripper, currentRightGripper,
-                                          _torsoVx, _torsoVz, _torsoWPitch, _torsoWYaw, _isIntervention, _eventToSend);
+                if (!_leftGrip)
+                {
+                    deltaPosL = Vector3.zero;
+                    deltaEulerL = Vector3.zero;
+                    // deltaGripperL = 0f;
+                }
+                if (!_rightGrip)
+                {
+                    deltaPosR = Vector3.zero;
+                    deltaEulerR = Vector3.zero;
+                    // deltaGripperR = 0f;
+                }
             }
+
+            _ = SendControllerDataAsync(deltaPosL, deltaEulerL,
+                                      deltaPosR, deltaEulerR, deltaGripperL, deltaGripperR,
+                                      _vx, _vy, _w, _torsoVx, _torsoVz, _torsoWPitch, _torsoWYaw, _isIntervention, _eventToSend);
 
             // 事件为一次性发送，发送后复位
             _eventToSend = MyTeleopEvent.None;
@@ -551,77 +541,86 @@ public class ControllerScript : MonoBehaviour
         return angle;
     }
 
-    async Task SendControllerDataAsync(Vector3 leftPos, Quaternion leftRot, Vector3 rightPos, Quaternion rightRot, float vx = 0f, float vy = 0f, float w = 0f, float leftGripperValue = 0f, float rightGripperValue = 0f, float torsoVx = 0f, float torsoVz = 0f, float torsoWPitch = 0f, float torsoWYaw = 0f, bool sendIsIntervention = false, MyTeleopEvent sendEvent = default)
+    // 统一处理姿态轴交换、基准更新与增量计算
+    void ComputePoseAndDelta(
+        Vector3 leftPos,
+        Quaternion leftRot,
+        Vector3 rightPos,
+        Quaternion rightRot,
+        float leftGripperValue,
+        float rightGripperValue,
+        out Vector3 deltaPosL,
+        out Vector3 deltaPosR,
+        out Vector3 deltaEulerL,
+        out Vector3 deltaEulerR,
+        out float deltaGripperL,
+        out float deltaGripperR)
+    {
+        // 当前手柄位置（已做轴交换）
+        Vector3 leftToSendSwapped = new Vector3(leftPos.z, -leftPos.x, leftPos.y);
+        Vector3 rightToSendSwapped = new Vector3(rightPos.z, -rightPos.x, rightPos.y);
+
+        Quaternion leftQuatSwapped = new Quaternion(-leftRot.y, leftRot.x, leftRot.z, leftRot.w);
+        Quaternion rightQuatSwapped = new Quaternion(-rightRot.y, rightRot.x, rightRot.z, rightRot.w);
+
+        // 再绕pitch轴（y轴）旋转-90度
+        Quaternion pitchMinus90 = Quaternion.AngleAxis(-90f, Vector3.up);
+        leftQuatSwapped = pitchMinus90 * leftQuatSwapped;
+        rightQuatSwapped = pitchMinus90 * rightQuatSwapped;
+
+        if (!hasLastSend)
+        {
+            // 首帧发送零增量，同时记录基准
+            deltaPosL = Vector3.zero;
+            deltaPosR = Vector3.zero;
+            deltaEulerL = Vector3.zero;
+            deltaEulerR = Vector3.zero;
+            deltaGripperL = 0f;
+            deltaGripperR = 0f;
+            hasLastSend = true;
+        }
+        else
+        {
+            deltaPosL = leftToSendSwapped - lastLeftPos;
+            deltaPosR = rightToSendSwapped - lastRightPos;
+
+            Quaternion deltaRotL = Quaternion.Inverse(lastLeftRot) * leftQuatSwapped;
+            Quaternion deltaRotR = Quaternion.Inverse(lastRightRot) * rightQuatSwapped;
+
+            Vector3 eulerL = deltaRotL.eulerAngles;
+            Vector3 eulerR = deltaRotR.eulerAngles;
+
+            deltaEulerL = new Vector3(
+                NormalizeAngle(eulerL.x) * Mathf.Deg2Rad,
+                NormalizeAngle(eulerL.y) * Mathf.Deg2Rad,
+                NormalizeAngle(eulerL.z) * Mathf.Deg2Rad
+            );
+
+            deltaEulerR = new Vector3(
+                NormalizeAngle(eulerR.x) * Mathf.Deg2Rad,
+                NormalizeAngle(eulerR.y) * Mathf.Deg2Rad,
+                NormalizeAngle(eulerR.z) * Mathf.Deg2Rad
+            );
+
+            deltaGripperL = leftGripperValue - lastLeftGripperSent;
+            deltaGripperR = rightGripperValue - lastRightGripperSent;
+        }
+
+        lastLeftPos = leftToSendSwapped;
+        lastRightPos = rightToSendSwapped;
+        lastLeftRot = leftQuatSwapped;
+        lastRightRot = rightQuatSwapped;
+        lastLeftGripperSent = leftGripperValue;
+        lastRightGripperSent = rightGripperValue;
+    }
+
+    async Task SendControllerDataAsync(Vector3 deltaPosL, Vector3 deltaEulerL, Vector3 deltaPosR, Vector3 deltaEulerR, float deltaGripperL = 0f, float deltaGripperR = 0f, float vx = 0f, float vy = 0f, float w = 0f, float torsoVx = 0f, float torsoVz = 0f, float torsoWPitch = 0f, float torsoWYaw = 0f, bool sendIsIntervention = false, MyTeleopEvent sendEvent = default)
     {
         // 如果连接已失败，不再发送
         if (!isConnected || stream == null || connectionFailed) return;
         
         try
         {
-            // 当前手柄位置（已做轴交换）
-            Vector3 leftToSendSwapped = new Vector3(leftPos.z, -leftPos.x, leftPos.y);
-            Vector3 rightToSendSwapped = new Vector3(rightPos.z, -rightPos.x, rightPos.y);
-
-            Quaternion leftQuatSwapped = new Quaternion(-leftRot.y, leftRot.x, leftRot.z, leftRot.w);
-            Quaternion rightQuatSwapped = new Quaternion(-rightRot.y, rightRot.x, rightRot.z, rightRot.w);
-
-            // 再绕pitch轴（y轴）旋转-90度
-            Quaternion pitchMinus90 = Quaternion.AngleAxis(-90f, Vector3.up);
-            leftQuatSwapped = pitchMinus90 * leftQuatSwapped;
-            rightQuatSwapped = pitchMinus90 * rightQuatSwapped;
-
-            Vector3 deltaPosL;
-            Vector3 deltaPosR;
-            Vector3 deltaEulerL;
-            Vector3 deltaEulerR;
-            float deltaGripperL;
-            float deltaGripperR;
-
-            if (!hasLastSend)
-            {
-                // 首帧发送零增量，同时记录基准
-                deltaPosL = Vector3.zero;
-                deltaPosR = Vector3.zero;
-                deltaEulerL = Vector3.zero;
-                deltaEulerR = Vector3.zero;
-                deltaGripperL = 0f;
-                deltaGripperR = 0f;
-                hasLastSend = true;
-            }
-            else
-            {
-                deltaPosL = leftToSendSwapped - lastLeftPos;
-                deltaPosR = rightToSendSwapped - lastRightPos;
-
-                Quaternion deltaRotL = Quaternion.Inverse(lastLeftRot) * leftQuatSwapped;
-                Quaternion deltaRotR = Quaternion.Inverse(lastRightRot) * rightQuatSwapped;
-
-                Vector3 eulerL = deltaRotL.eulerAngles;
-                Vector3 eulerR = deltaRotR.eulerAngles;
-
-                deltaEulerL = new Vector3(
-                    NormalizeAngle(eulerL.x) * Mathf.Deg2Rad,
-                    NormalizeAngle(eulerL.y) * Mathf.Deg2Rad,
-                    NormalizeAngle(eulerL.z) * Mathf.Deg2Rad
-                );
-
-                deltaEulerR = new Vector3(
-                    NormalizeAngle(eulerR.x) * Mathf.Deg2Rad,
-                    NormalizeAngle(eulerR.y) * Mathf.Deg2Rad,
-                    NormalizeAngle(eulerR.z) * Mathf.Deg2Rad
-                );
-
-                deltaGripperL = leftGripperValue - lastLeftGripperSent;
-                deltaGripperR = rightGripperValue - lastRightGripperSent;
-            }
-
-            lastLeftPos = leftToSendSwapped;
-            lastRightPos = rightToSendSwapped;
-            lastLeftRot = leftQuatSwapped;
-            lastRightRot = rightQuatSwapped;
-            lastLeftGripperSent = leftGripperValue;
-            lastRightGripperSent = rightGripperValue;
-
             // 构造 send_action 命令，包含chassis_speed、torso_speed、gripper和可选reset
             // 注意：这里改为发送 droll, dpitch, dyaw (6个元素)
             if (sendEvent.Type != TeleopEventType.NONE)
