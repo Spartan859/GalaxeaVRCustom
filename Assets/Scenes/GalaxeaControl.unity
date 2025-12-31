@@ -1778,17 +1778,17 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::ControllerScript
   serverHost: 192.168.3.81
-  serverPort: 50055
+  serverPort: 50051
   sendInterval: 0.02
   pingInterval: 1
   pingTimeoutMs: 2000
   maxQueueSize: 100
   modeToggleDuration: 1
   resetCommandDuration: 1
-  joystickDeadzone: 0.15
+  joystickDeadzone: 0.5
   maxVx: 0.2
   maxVy: -0.2
-  maxW: -1
+  maxW: -0.2
   gripperChangeSpeed: 50
   gripperShortPressTime: 0.3
   maxTorsoVx: 0.2

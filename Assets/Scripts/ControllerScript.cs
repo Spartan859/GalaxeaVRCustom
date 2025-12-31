@@ -76,10 +76,6 @@ public class ControllerScript : MonoBehaviour
     private float thumbstickPressTimer = 0f;
     private bool isThumbstickPressed = false;
     private bool modeToggleInThisPress = false;  // 当前按下周期中是否已经切换过一次模式
-    private float rightThumbstickPressTimer = 0f;  // 右摇杆按下的计时
-    private bool isRightThumbstickPressed = false;  // 右摇杆是否被按下
-    private bool resetCommandInThisPress = false;  // 当前按下周期中是否已经发送过reset指令
-    private bool resetRequested = false;  // 是否请求了reset
     private float currentLeftGripper = 100f;
     private float currentRightGripper = 100f;
     private float leftTriggerTimer = 0f;
@@ -126,6 +122,50 @@ public class ControllerScript : MonoBehaviour
     }
     
     private ControlMode currentMode = ControlMode.Reset;
+
+    // 上层模式：Normal / Event
+    private enum UpperControlMode
+    {
+        Normal,
+        Event
+    }
+
+    private UpperControlMode currentUpperMode = UpperControlMode.Normal;
+
+    // Teleop 事件枚举与包装类型
+    public enum TeleopEventType
+    {
+        NONE = 0,
+        SUCCESS = 1,
+        RERECORD = 2,
+        TERMINATE = 3
+    }
+
+    public struct MyTeleopEvent
+    {
+        public TeleopEventType Type;
+
+        public MyTeleopEvent(TeleopEventType type)
+        {
+            Type = type;
+        }
+
+        public override string ToString()
+        {
+            switch (Type)
+            {
+                case TeleopEventType.SUCCESS: return "success";
+                case TeleopEventType.RERECORD: return "rerecord";
+                case TeleopEventType.TERMINATE: return "terminate";
+                default: return "none";
+            }
+        }
+
+        public static MyTeleopEvent Success => new MyTeleopEvent(TeleopEventType.SUCCESS);
+        public static MyTeleopEvent Rerecord => new MyTeleopEvent(TeleopEventType.RERECORD);
+        public static MyTeleopEvent Terminate => new MyTeleopEvent(TeleopEventType.TERMINATE);
+        public static MyTeleopEvent None => new MyTeleopEvent(TeleopEventType.NONE);
+    }
     
     async void Start()
     {
@@ -183,16 +223,126 @@ public class ControllerScript : MonoBehaviour
         receiveTask = Task.Run(() => ProcessReceiveQueue(receiveCts.Token));
     }
     
+    // 简化的更新阶段机（把原来冗长的 Update 拆分为多个小方法）
+    private enum UpdatePhase { ReconnectCheck, SampleTransforms, ApplyDeadzoneAndInputs, HandleModeAndControls, HandleGrippers, SendAndPing, UpdateLastButtons, Done }
+
+    // 临时状态/输入字段（供拆分方法使用）
+    private Vector2 _leftStick;
+    private Vector2 _rightStick;
+    private Vector3 _leftControllerPosition;
+    private Quaternion _leftControllerRotation;
+    private Vector3 _rightControllerPosition;
+    private Quaternion _rightControllerRotation;
+    private Vector3 _headPositionTemp;
+    private Quaternion _headRotationTemp;
+    private bool _aButtonDown;
+    private bool _bButtonDown;
+    private bool _xButtonDown;
+    private bool _yButtonDown;
+    private bool _leftGrip;
+    private bool _rightGrip;
+    private bool _leftTriggerDown;
+    private bool _rightTriggerDown;
+    private float _vx, _vy, _w, _torsoVz, _torsoVx, _torsoWPitch, _torsoWYaw;
+    private MyTeleopEvent _eventToSend = MyTeleopEvent.None;
+    private bool _isIntervention = false;
+    private bool _lastLeftThumbBtn = false;
+    private bool _lastRightThumbBtn = false;
+    private bool _leftThumbButtonDown = false;
+    private bool _rightThumbButtonDown = false;
+
+    // OVR 输入统一采样
+    void CaptureInputs()
+    {
+        // 按钮 / 摇杆 / 触发器
+        _aButtonDown = OVRInput.Get(OVRInput.Button.One);
+        _bButtonDown = OVRInput.Get(OVRInput.Button.Two);
+        _xButtonDown = OVRInput.Get(OVRInput.Button.Three);
+        _yButtonDown = OVRInput.Get(OVRInput.Button.Four);
+        _leftGrip = OVRInput.Get(OVRInput.Button.PrimaryHandTrigger);
+        _rightGrip = OVRInput.Get(OVRInput.Button.SecondaryHandTrigger);
+        _leftTriggerDown = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger);
+        _rightTriggerDown = OVRInput.Get(OVRInput.Button.SecondaryIndexTrigger);
+        _leftThumbButtonDown = OVRInput.Get(OVRInput.Button.PrimaryThumbstick);
+        _rightThumbButtonDown = OVRInput.Get(OVRInput.Button.SecondaryThumbstick);
+        _leftStick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick);
+        _rightStick = OVRInput.Get(OVRInput.Axis2D.SecondaryThumbstick);
+
+        // 头部与手柄位置/姿态（相对于头显）
+        _headPositionTemp = Vector3.zero;
+        _headRotationTemp = Quaternion.identity;
+        if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
+        {
+            _headPositionTemp = ovrCameraRig.centerEyeAnchor.position;
+            _headRotationTemp = ovrCameraRig.centerEyeAnchor.rotation;
+        }
+
+        Quaternion headRotationInverse = Quaternion.Inverse(_headRotationTemp);
+        Vector3 leftControllerWorldPosition = OVRInput.GetLocalControllerPosition(OVRInput.Controller.LTouch);
+        Quaternion leftControllerWorldRotation = OVRInput.GetLocalControllerRotation(OVRInput.Controller.LTouch);
+        Vector3 rightControllerWorldPosition = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
+        Quaternion rightControllerWorldRotation = OVRInput.GetLocalControllerRotation(OVRInput.Controller.RTouch);
+
+        _leftControllerPosition = headRotationInverse * (leftControllerWorldPosition - _headPositionTemp);
+        _leftControllerRotation = headRotationInverse * leftControllerWorldRotation;
+        _rightControllerPosition = headRotationInverse * (rightControllerWorldPosition - _headPositionTemp);
+        _rightControllerRotation = headRotationInverse * rightControllerWorldRotation;
+    }
+
     void Update()
     {
-        // 在断线/失败状态下仍需响应重连快捷键，先采样 A/X 用于边沿检测
-        bool aNowForReconnect = OVRInput.Get(OVRInput.Button.One);
-        bool xNowForReconnect = OVRInput.Get(OVRInput.Button.Three);
-        // 少量信息性日志，便于确认按键采样与状态（仅在断线或有按键时打印，避免刷屏）
-        if (connectionFailed || aNowForReconnect || xNowForReconnect)
+        // 统一采样所有 OVR 输入（按钮、摇杆、触发器、位置姿态）
+        CaptureInputs();
+
+        // 公共：连接检查与快捷重连
+        SampleReconnectKeys();
+        if (connectionFailed) return;
+        if (!isConnected) return;
+
+        // 监听左右摇杆按钮组合（下降沿）以切换上层模式
+        bool comboLast = _lastLeftThumbBtn && _lastRightThumbBtn;
+        bool comboNow = _leftThumbButtonDown && _rightThumbButtonDown;
+        if (comboLast && !comboNow)
         {
-            Debug.Log($"A+X sample: A={aNowForReconnect}, X={xNowForReconnect}, connectionFailed={connectionFailed}, lastA={lastAButtonDown}, lastX={lastXButtonDown}, isReconnecting={isReconnecting}, isConnected={isConnected}");
+            currentUpperMode = currentUpperMode == UpperControlMode.Normal ? UpperControlMode.Event : UpperControlMode.Normal;
+            hasLastSend = false; // 模式切换时重置增量基准
+            Debug.Log($"上层模式切换为: {currentUpperMode}");
         }
+        _lastLeftThumbBtn = _leftThumbButtonDown;
+        _lastRightThumbBtn = _rightThumbButtonDown;
+
+        if (currentUpperMode == UpperControlMode.Normal)
+        {
+            _isIntervention = true;
+            _eventToSend = MyTeleopEvent.None;
+
+            SampleHeadAndControllers();
+            ApplyDeadzoneAndComputeSpeeds();
+            HandleModeSwitch();
+            HandleGripperInputs();
+            HandleSendAndPing();
+            UpdateLastButtonStates();
+        }
+        else // UpperControlMode.Event
+        {
+            _isIntervention = false;
+            _eventToSend = MyTeleopEvent.None;
+
+            // 清零运动量，避免误发送移动指令
+            _vx = _vy = _w = 0f;
+            _torsoVz = _torsoVx = _torsoWPitch = _torsoWYaw = 0f;
+
+            CheckButtonAndSetEvent();
+            HandleSendAndPing();
+            UpdateLastButtonStates();
+        }
+    }
+
+    // --------------- 拆分后的辅助方法 ---------------
+    void SampleReconnectKeys()
+    {
+        bool aNowForReconnect = _aButtonDown;
+        bool xNowForReconnect = _xButtonDown;
 
         if (connectionFailed && aNowForReconnect && xNowForReconnect)
         {
@@ -201,139 +351,61 @@ public class ControllerScript : MonoBehaviour
                 Debug.Log("A+X 边沿检测通过：重置 connectionFailed，重置 reconnectAttempts 并调用 ConnectToServer()");
                 connectionFailed = false;
                 reconnectAttempts = 0;
-                try
-                {
-                    _ = ConnectToServer();
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning($"调用 ConnectToServer() 时捕获异常: {ex.Message}");
-                }
+                try { _ = ConnectToServer(); } catch (Exception ex) { Debug.LogWarning($"调用 ConnectToServer() 时捕获异常: {ex.Message}"); }
             }
             else
             {
                 Debug.Log("A+X 同时按下但已在上一帧保持，忽略重复触发");
             }
         }
-        // 立即更新上一帧按键状态，避免重复触发
-        lastAButtonDown = aNowForReconnect;
-        lastXButtonDown = xNowForReconnect;
+    }
 
-        // 如果连接已彻底失败，停止其他操作
-        if (connectionFailed) return;
+    void SampleHeadAndControllers()
+    {
+        // 已在 CaptureInputs 中采样
+    }
 
-        if (!isConnected) return;
-        
-        // 获取头显（VR眼镜）的位置和旋转
-        Vector3 headPosition = Vector3.zero;
-        Quaternion headRotation = Quaternion.identity;
-        
-        if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
+    void ApplyDeadzoneAndComputeSpeeds()
+    {
+        if (Mathf.Abs(_leftStick.x) < joystickDeadzone) _leftStick.x = 0f;
+        if (Mathf.Abs(_leftStick.y) < joystickDeadzone) _leftStick.y = 0f;
+        if (Mathf.Abs(_rightStick.x) < joystickDeadzone) _rightStick.x = 0f;
+        if (Mathf.Abs(_rightStick.y) < joystickDeadzone) _rightStick.y = 0f;
+
+        _vx = Mathf.Clamp(_leftStick.y, -1f, 1f) * maxVx;
+        _vy = Mathf.Clamp(_leftStick.x, -1f, 1f) * maxVy;
+        _w = Mathf.Clamp(_rightStick.x, -1f, 1f) * maxW;
+
+        _torsoVz = Mathf.Clamp(_rightStick.y, -1f, 1f) * maxTorsoVz;
+
+        _torsoWPitch = 0f;
+        if (_xButtonDown) _torsoWPitch -= maxTorsoWPitch;
+        if (_yButtonDown) _torsoWPitch += maxTorsoWPitch;
+
+        _torsoWYaw = 0f;
+        if (_rightThumbButtonDown)
         {
-            headPosition = ovrCameraRig.centerEyeAnchor.position;
-            headRotation = ovrCameraRig.centerEyeAnchor.rotation;
-        }
-        
-        Quaternion headRotationInverse = Quaternion.Inverse(headRotation);
-        
-        // 获取手柄在世界坐标系下的位置和旋转
-        Vector3 leftControllerWorldPosition = OVRInput.GetLocalControllerPosition(OVRInput.Controller.LTouch);
-        Quaternion leftControllerWorldRotation = OVRInput.GetLocalControllerRotation(OVRInput.Controller.LTouch);
-        
-        Vector3 rightControllerWorldPosition = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
-        Quaternion rightControllerWorldRotation = OVRInput.GetLocalControllerRotation(OVRInput.Controller.RTouch);
-        
-        // 转换为相对于头显的位置和旋转
-        Vector3 leftControllerPosition = headRotationInverse * (leftControllerWorldPosition - headPosition);
-        Quaternion leftControllerRotation = headRotationInverse * leftControllerWorldRotation;
-        
-        Vector3 rightControllerPosition = headRotationInverse * (rightControllerWorldPosition - headPosition);
-        Quaternion rightControllerRotation = headRotationInverse * rightControllerWorldRotation;
-        
-        // 计算欧拉角（弧度）
-        Vector3 leftEulerRad = leftControllerRotation.eulerAngles * Mathf.Deg2Rad;
-        Vector3 rightEulerRad = rightControllerRotation.eulerAngles * Mathf.Deg2Rad;
-        
-        // 转换为度数方便阅读
-        Vector3 leftEulerDeg = leftControllerRotation.eulerAngles;
-        Vector3 rightEulerDeg = rightControllerRotation.eulerAngles;
-        
-        // Debug.Log($"[当前手柄角度] 左手: Roll={leftEulerDeg.x:F2}° Pitch={leftEulerDeg.y:F2}° Yaw={leftEulerDeg.z:F2}° | 右手: Roll={rightEulerDeg.x:F2}° Pitch={rightEulerDeg.y:F2}° Yaw={rightEulerDeg.z:F2}°");
-        
-        // 摇杆长按切换逻辑已移除，改为使用左右握把同时按下切换模式
-        
-        // 获取左摇杆（PrimaryThumbstick）和右摇杆（SecondaryThumbstick）输入
-        Vector2 leftStick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick);
-        Vector2 rightStick = OVRInput.Get(OVRInput.Axis2D.SecondaryThumbstick);
-        
-        // 应用死区：如果某个轴的值小于死区阈值，将其设为0
-        if (Mathf.Abs(leftStick.x) < joystickDeadzone) leftStick.x = 0f;
-        if (Mathf.Abs(leftStick.y) < joystickDeadzone) leftStick.y = 0f;
-        if (Mathf.Abs(rightStick.x) < joystickDeadzone) rightStick.x = 0f;
-        if (Mathf.Abs(rightStick.y) < joystickDeadzone) rightStick.y = 0f;
-        
-        // 检测右摇杆按下(OVRInput.Button.SecondaryThumbstick)，仅在Reset模式下有效
-        bool rightThumbstickDown = OVRInput.Get(OVRInput.Button.SecondaryThumbstick);
-        
-        if (currentMode == ControlMode.Reset && rightThumbstickDown)
-        {
-            if (!isRightThumbstickPressed)
-            {
-                // 刚按下，开始计时
-                isRightThumbstickPressed = true;
-                rightThumbstickPressTimer = 0f;
-                resetCommandInThisPress = false;  // 重置本次按下的reset指令标志
-            }
-            else
-            {
-                // 持续按下，累加时间
-                rightThumbstickPressTimer += Time.deltaTime;
-                
-                // 检查是否达到发送reset指令的时长，且在本次按下中还未发送过
-                if (rightThumbstickPressTimer >= resetCommandDuration && !resetCommandInThisPress)
-                {
-                    resetRequested = true;  // 标记reset请求
-                    resetCommandInThisPress = true;  // 标记本次按下已经发送过reset指令
-                }
-            }
-        }
-        else
-        {
-            // 松开摇杆或离开Reset模式，重置状态
-            isRightThumbstickPressed = false;
-            rightThumbstickPressTimer = 0f;
-            resetCommandInThisPress = false;  // 重置reset指令标志，为下一次按下做准备
+            _torsoWYaw = Mathf.Clamp(_rightStick.x, -1f, 1f) * maxTorsoWYaw;
         }
 
-        // chassis_speed: vx, vy, w
-        float vx = Mathf.Clamp(leftStick.y, -1f, 1f) * maxVx; // 前后
-        float vy = Mathf.Clamp(leftStick.x, -1f, 1f) * maxVy; // 左右
-        float w = Mathf.Clamp(rightStick.x, -1f, 1f) * maxW; // 右手横向
+        // 当按住右摇杆时，右摇杆左右推动只控制躯干偏航，不再用于底盘角速度
+        if (_rightThumbButtonDown)
+        {
+            _w = 0f;
+        }
 
-        // torso_speed: vx, vz, w_pitch, w_yaw
-        // vz: 右摇杆竖向（升降）
-        float torsoVz = Mathf.Clamp(rightStick.y, -1f, 1f) * maxTorsoVz;
-        
-        // w_pitch: X和Y键（俯仰）
-        bool yButtonDown = OVRInput.Get(OVRInput.Button.Four);     // X键：抬起
-        bool xButtonDown = OVRInput.Get(OVRInput.Button.Three);    // Y键：低头
-        float torsoWPitch = 0f;
-        if (xButtonDown) torsoWPitch -= maxTorsoWPitch;
-        if (yButtonDown) torsoWPitch += maxTorsoWPitch;
-        
-        // w_yaw: 左G和右G（转向）
-        bool leftGrip = OVRInput.Get(OVRInput.Button.PrimaryHandTrigger);
-        bool rightGrip = OVRInput.Get(OVRInput.Button.SecondaryHandTrigger);
-        float torsoWYaw = 0f;
-        if (leftGrip) torsoWYaw += maxTorsoWYaw;
-        if (rightGrip) torsoWYaw -= maxTorsoWYaw;
+        _torsoVx = 0f;
+        if (_aButtonDown) _torsoVx -= maxTorsoVx;
+        if (_bButtonDown) _torsoVx += maxTorsoVx;
+    }
 
-        // 新的模式绑定：当左右握把同时按下时进入 BiManual，否则为 Reset
-        bool bothGrips = leftGrip && rightGrip;
+    void HandleModeSwitch()
+    {
+        bool bothGrips = _leftGrip && _rightGrip;
         if (bothGrips && currentMode != ControlMode.BiManual)
         {
             currentMode = ControlMode.BiManual;
-            hasLastSend = false; // 切换到 BiManual 时重置基准以避免巨大增量
+            hasLastSend = false;
             Debug.Log("模式切换：检测到左右握把同时按下，已切换到 BiManual 模式");
         }
         else if (!bothGrips && currentMode != ControlMode.Reset)
@@ -342,40 +414,26 @@ public class ControllerScript : MonoBehaviour
             hasLastSend = false;
             Debug.Log("模式切换：左右握把未同时按下，已切换到 Reset 模式");
         }
-        
-        // vx: A和B键（前后）
-        bool aButtonDown = OVRInput.Get(OVRInput.Button.One);      // A键：后退
-        bool bButtonDown = OVRInput.Get(OVRInput.Button.Two);      // B键：前进
-        float torsoVx = 0f;
-        if (aButtonDown) torsoVx -= maxTorsoVx;
-        if (bButtonDown) torsoVx += maxTorsoVx;
+    }
 
-
-
-        // 检测LT/RT按键，控制夹爪
-        bool leftTriggerDown = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger);
-        bool rightTriggerDown = OVRInput.Get(OVRInput.Button.SecondaryIndexTrigger);
-        
-        // 左夹爪逻辑
-        if (leftTriggerDown)
+    void HandleGripperInputs()
+    {
+        if (_leftTriggerDown)
         {
             leftTriggerTimer += Time.deltaTime;
-            // 长按：缓慢减小数值
             currentLeftGripper -= gripperChangeSpeed * Time.deltaTime;
         }
         else
         {
-            // 松开瞬间判断是否为短按
             if (leftTriggerTimer > 0f && leftTriggerTimer < gripperShortPressTime)
             {
-                currentLeftGripper = 100f; // 短按恢复
+                currentLeftGripper = 100f;
             }
             leftTriggerTimer = 0f;
         }
         currentLeftGripper = Mathf.Clamp(currentLeftGripper, 0f, 100f);
 
-        // 右夹爪逻辑
-        if (rightTriggerDown)
+        if (_rightTriggerDown)
         {
             rightTriggerTimer += Time.deltaTime;
             currentRightGripper -= gripperChangeSpeed * Time.deltaTime;
@@ -389,58 +447,102 @@ public class ControllerScript : MonoBehaviour
             rightTriggerTimer = 0f;
         }
         currentRightGripper = Mathf.Clamp(currentRightGripper, 0f, 100f);
+    }
 
-        // 按照设定的时间间隔发送数据
+    bool IsFallingEdge(bool current, bool last) => last && !current;
+
+    void CheckButtonAndSetEvent()
+    {
+        // 按键按下定义为“下降沿”
+        if (IsFallingEdge(_aButtonDown, lastAButtonDown))
+        {
+            _eventToSend = MyTeleopEvent.Success;
+            return;
+        }
+        if (IsFallingEdge(_bButtonDown, lastBButtonDown))
+        {
+            _eventToSend = MyTeleopEvent.Rerecord;
+            return;
+        }
+        if (IsFallingEdge(_xButtonDown, lastXButtonDown))
+        {
+            _eventToSend = MyTeleopEvent.Terminate;
+            return;
+        }
+        // 其他按键或无下降沿则保持 NONE（在调用处已初始化）
+    }
+
+    void HandleSendAndPing()
+    {
         timer += Time.deltaTime;
         if (timer >= sendInterval)
         {
             timer = 0f;
-            if (currentMode == ControlMode.BiManual)
+            Vector3 sendLeftPos = _leftControllerPosition;
+            Quaternion sendLeftRot = _leftControllerRotation;
+            Vector3 sendRightPos = _rightControllerPosition;
+            Quaternion sendRightRot = _rightControllerRotation;
+
+            // Event 模式下发送零机械臂姿态，仅携带事件和干预标志
+            if (currentUpperMode == UpperControlMode.Event)
             {
-                // BiManual模式下发送机械臂+底盘+躯干
-                _ = SendControllerDataAsync(leftControllerPosition, leftControllerRotation, 
-                                          rightControllerPosition, rightControllerRotation, vx, vy, w, currentLeftGripper, currentRightGripper,
-                                          torsoVx, torsoVz, torsoWPitch, torsoWYaw, resetRequested);
+                sendLeftPos = Vector3.zero;
+                sendRightPos = Vector3.zero;
+                sendLeftRot = Quaternion.identity;
+                sendRightRot = Quaternion.identity;
+            }
+
+            // 不再支持按住 X+Y 或 A+B 进行手部复制。仅在 BiManual 模式下发送实际手柄数据，
+            // 在 Reset 模式下发送零机械臂数据（保持之前的语义）。
+            if (currentMode == ControlMode.BiManual && currentUpperMode == UpperControlMode.Normal)
+            {
+                _ = SendControllerDataAsync(sendLeftPos, sendLeftRot,
+                                          sendRightPos, sendRightRot, _vx, _vy, _w, currentLeftGripper, currentRightGripper,
+                                          _torsoVx, _torsoVz, _torsoWPitch, _torsoWYaw, _isIntervention, _eventToSend);
             }
             else
             {
-                // Reset模式下只发送底盘+躯干，机械臂数据为零
-                _ = SendControllerDataAsync(Vector3.zero, Quaternion.identity, Vector3.zero, Quaternion.identity, vx, vy, w, currentLeftGripper, currentRightGripper,
-                                          torsoVx, torsoVz, torsoWPitch, torsoWYaw, resetRequested);
+                _ = SendControllerDataAsync(Vector3.zero, Quaternion.identity, Vector3.zero, Quaternion.identity, _vx, _vy, _w, currentLeftGripper, currentRightGripper,
+                                          _torsoVx, _torsoVz, _torsoWPitch, _torsoWYaw, _isIntervention, _eventToSend);
             }
-            resetRequested = false;  // 清除reset标志
+
+            // 事件为一次性发送，发送后复位
+            _eventToSend = MyTeleopEvent.None;
         }
-        
-        // 按照设定的时间间隔发送ping指令
+
         pingTimer += Time.deltaTime;
         if (pingTimer >= pingInterval)
         {
             pingTimer = 0f;
             _ = SendPingAsync();
         }
+    }
 
-        // 更新上一帧按钮状态（用于边沿检测）
-        lastAButtonDown = aButtonDown;
-        lastXButtonDown = xButtonDown;
+    void UpdateLastButtonStates()
+    {
+        lastAButtonDown = _aButtonDown;
+        lastBButtonDown = _bButtonDown;
+        lastXButtonDown = _xButtonDown;
+        lastYButtonDown = _yButtonDown;
     }
     
-    void ToggleMode()
-    {
-        if (currentMode == ControlMode.Reset)
-        {
-            // 从Reset切换到BiManual
-            currentMode = ControlMode.BiManual;
-            Debug.Log("切换到 BiManual 模式");
-            hasLastSend = false;
-        }
-        else
-        {
-            // 从BiManual切换到Reset
-            currentMode = ControlMode.Reset;
-            Debug.Log("切换到 Reset 模式");
-            hasLastSend = false;
-        }
-    }
+    // void ToggleMode()
+    // {
+    //     if (currentMode == ControlMode.Reset)
+    //     {
+    //         // 从Reset切换到BiManual
+    //         currentMode = ControlMode.BiManual;
+    //         Debug.Log("切换到 BiManual 模式");
+    //         hasLastSend = false;
+    //     }
+    //     else
+    //     {
+    //         // 从BiManual切换到Reset
+    //         currentMode = ControlMode.Reset;
+    //         Debug.Log("切换到 Reset 模式");
+    //         hasLastSend = false;
+    //     }
+    // }
     
     float NormalizeAngle(float angle)
     {
@@ -449,7 +551,7 @@ public class ControllerScript : MonoBehaviour
         return angle;
     }
 
-    async Task SendControllerDataAsync(Vector3 leftPos, Quaternion leftRot, Vector3 rightPos, Quaternion rightRot, float vx = 0f, float vy = 0f, float w = 0f, float leftGripperValue = 0f, float rightGripperValue = 0f, float torsoVx = 0f, float torsoVz = 0f, float torsoWPitch = 0f, float torsoWYaw = 0f, bool sendReset = false)
+    async Task SendControllerDataAsync(Vector3 leftPos, Quaternion leftRot, Vector3 rightPos, Quaternion rightRot, float vx = 0f, float vy = 0f, float w = 0f, float leftGripperValue = 0f, float rightGripperValue = 0f, float torsoVx = 0f, float torsoVz = 0f, float torsoWPitch = 0f, float torsoWYaw = 0f, bool sendIsIntervention = false, MyTeleopEvent sendEvent = default)
     {
         // 如果连接已失败，不再发送
         if (!isConnected || stream == null || connectionFailed) return;
@@ -522,14 +624,20 @@ public class ControllerScript : MonoBehaviour
 
             // 构造 send_action 命令，包含chassis_speed、torso_speed、gripper和可选reset
             // 注意：这里改为发送 droll, dpitch, dyaw (6个元素)
+            if (sendEvent.Type != TeleopEventType.NONE)
+            {
+                Debug.Log($"SendControllerDataAsync: sendEvent={sendEvent}");
+            }
+
             string jsonData = string.Format(
-                "{{\"cmd\":\"send_action\",\"action\":{{\"left_ee_pose\":[{0},{1},{2},{3},{4},{5}],\"right_ee_pose\":[{6},{7},{8},{9},{10},{11}],\"left_gripper\":{12},\"right_gripper\":{13},\"chassis_speed\":[{14},{15},{16}],\"torso_speed\":[{17},{18},{19},{20}],\"reset\":{21}}}}}",
+                "{{\"cmd\":\"send_action\",\"action\":{{\"left_ee_pose\":[{0},{1},{2},{3},{4},{5}],\"right_ee_pose\":[{6},{7},{8},{9},{10},{11}],\"left_gripper\":{12},\"right_gripper\":{13},\"chassis_speed\":[{14},{15},{16}],\"torso_speed\":[{17},{18},{19},{20}],\"isIntervention\":{21},\"event\":\"{22}\"}}}}",
                 deltaPosL.x, deltaPosL.y, deltaPosL.z, deltaEulerL.x, deltaEulerL.y, deltaEulerL.z,
                 deltaPosR.x, deltaPosR.y, deltaPosR.z, deltaEulerR.x, deltaEulerR.y, deltaEulerR.z,
                 deltaGripperL, deltaGripperR,
                 vx, vy, w,
                 torsoVx, torsoVz, torsoWPitch, torsoWYaw,
-                sendReset.ToString().ToLower()  // 转为小写 "true" 或 "false"
+                sendIsIntervention.ToString().ToLower(),
+                sendEvent.ToString()
             );
             
             EnqueueMessage(jsonData);
@@ -850,8 +958,6 @@ public class ControllerScript : MonoBehaviour
             responseWaitLock.Release();
         }
     }
-
-
 
     void EnqueueMessage(string json)
     {
